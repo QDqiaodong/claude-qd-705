@@ -7,7 +7,6 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -15,12 +14,16 @@ import org.springframework.transaction.annotation.Transactional;
 import com.brewery.craft.common.BizException;
 import com.brewery.craft.domain.Batch;
 import com.brewery.craft.domain.Fermenter;
+import com.brewery.craft.domain.QcRound;
 import com.brewery.craft.domain.Recipe;
+import com.brewery.craft.domain.Shipment;
 import com.brewery.craft.dto.BatchDtos;
 import com.brewery.craft.dto.Views;
 import com.brewery.craft.repository.BatchRepository;
 import com.brewery.craft.repository.FermenterRepository;
+import com.brewery.craft.repository.QcRoundRepository;
 import com.brewery.craft.repository.RecipeRepository;
+import com.brewery.craft.repository.ShipmentRepository;
 
 /** 模块二：啤酒批次（状态流转 + @ElementCollection 曲线）。 */
 @Service
@@ -30,13 +33,22 @@ public class BatchService {
     private final BatchRepository batchRepository;
     private final RecipeRepository recipeRepository;
     private final FermenterRepository fermenterRepository;
+    private final QcRoundRepository qcRoundRepository;
+    private final ShipmentRepository shipmentRepository;
+    private final QcGate qcGate;
 
     public BatchService(BatchRepository batchRepository,
                         RecipeRepository recipeRepository,
-                        FermenterRepository fermenterRepository) {
+                        FermenterRepository fermenterRepository,
+                        QcRoundRepository qcRoundRepository,
+                        ShipmentRepository shipmentRepository,
+                        QcGate qcGate) {
         this.batchRepository = batchRepository;
         this.recipeRepository = recipeRepository;
         this.fermenterRepository = fermenterRepository;
+        this.qcRoundRepository = qcRoundRepository;
+        this.shipmentRepository = shipmentRepository;
+        this.qcGate = qcGate;
     }
 
     public List<Views.BatchView> list(String status) {
@@ -59,7 +71,12 @@ public class BatchService {
         if (b.getRecipeId() != null) {
             recipeName = recipeRepository.findById(b.getRecipeId()).map(Recipe::getName).orElse("");
         }
-        return Views.BatchView.of(b, recipeName);
+        QcRound latest = qcRoundRepository.findLatestByBatchId(b.getId()).orElse(null);
+        long roundCount = qcRoundRepository.countByBatchId(b.getId());
+        QcGate.QcState state = qcGate.evaluate(b, latest, roundCount);
+        Views.BatchQcStateView qc =
+                Views.BatchQcStateView.of(state.code, state.latestRound, state.reason, state.roundCount);
+        return Views.BatchView.of(b, recipeName, qc);
     }
 
     @Transactional
@@ -98,10 +115,13 @@ public class BatchService {
     /**
      * 状态推进：计划 → 糖化 → 煮沸 → 发酵 → 熟成 → 已灌装。
      * 走到哪一步就把这一步的时间戳钉上，并同步罐体状态。
+     *
+     * 终态规则：推进到「已灌装」必须最新一轮质检明确放行、放行轮带必要测量，
+     * 且批次已有灌装记录 —— 放行是灌装的真实前提，不是页面标签。
      */
     @Transactional
     public Views.BatchView advance(Long id, String targetStatus) {
-        Batch b = batchRepository.findById(id).orElseThrow(() -> new BizException("批次不存在"));
+        Batch b = batchRepository.findByIdForUpdate(id).orElseThrow(() -> new BizException("批次不存在"));
         if ("SCRAPPED".equals(b.getStatus())) {
             throw new BizException("已报废批次不能再推进");
         }
@@ -113,6 +133,11 @@ public class BatchService {
             if (!targetStatus.equals(next)) {
                 throw new BizException("只能单向推进到" + Views.batchStatusName(next));
             }
+        }
+        if ("PACKAGED".equals(next)) {
+            QcRound latest = qcRoundRepository.findLatestByBatchId(b.getId()).orElse(null);
+            long roundCount = qcRoundRepository.countByBatchId(b.getId());
+            qcGate.assertCanPackage(b, qcGate.evaluate(b, latest, roundCount));
         }
         LocalDateTime now = LocalDateTime.now();
         switch (next) {
@@ -141,15 +166,40 @@ public class BatchService {
         return view(saved);
     }
 
+    /**
+     * 报废：终态规则。
+     *   - 已灌装批次不能报废；
+     *   - 一旦报废，已存在但未发出的出货单（PENDING/FROZEN）全部冻结，已发/已结款历史单不动；
+     *   - 报废后不能再发起质检、灌装、出货。
+     */
     @Transactional
     public Views.BatchView scrap(Long id) {
-        Batch b = batchRepository.findById(id).orElseThrow(() -> new BizException("批次不存在"));
+        Batch b = batchRepository.findByIdForUpdate(id).orElseThrow(() -> new BizException("批次不存在"));
         if ("PACKAGED".equals(b.getStatus())) {
             throw new BizException("已灌装批次不能报废");
+        }
+        if ("SCRAPPED".equals(b.getStatus())) {
+            throw new BizException("批次已报废，无需重复操作");
+        }
+        boolean activeShipment = shipmentRepository.findAllByBatchNoOrderByIdAsc(b.getBatchNo()).stream()
+                .anyMatch(s -> "SHIPPED".equals(s.getStatus()) || "PAID".equals(s.getStatus()));
+        if (activeShipment) {
+            throw new BizException("该批次存在已发出或已结款的出货单，历史单据不能因报废被改写，报废被阻止");
         }
         b.setStatus("SCRAPPED");
         b.setUpdatedAt(LocalDateTime.now());
         Batch saved = batchRepository.save(b);
+        // 未发出货单全部冻结，原因钉死，重新放行也不能自动恢复（批次已是终态报废）
+        LocalDateTime now = LocalDateTime.now();
+        for (Shipment s : shipmentRepository.findAllByBatchNoOrderByIdAsc(b.getBatchNo())) {
+            if ("PENDING".equals(s.getStatus()) || "FROZEN".equals(s.getStatus())) {
+                s.setStatus("FROZEN");
+                s.setFrozenReason("批次 " + b.getBatchNo() + " 已报废，出货单永久冻结");
+                s.setFrozenAt(now);
+                s.setUpdatedAt(now);
+                shipmentRepository.save(s);
+            }
+        }
         syncTank(saved);
         return view(saved);
     }
@@ -158,7 +208,7 @@ public class BatchService {
         if (batch.getFermenterNo() == null || batch.getFermenterNo().isBlank()) {
             return;
         }
-        Optional<Fermenter> tank = fermenterRepository.findByTankNo(batch.getFermenterNo());
+        var tank = fermenterRepository.findByTankNo(batch.getFermenterNo());
         if (tank.isEmpty()) {
             return;
         }
@@ -216,7 +266,7 @@ public class BatchService {
     /** 产量汇总：按状态聚合 */
     public Views.BatchSummary summary() {
         List<Batch> batches = batchRepository.findAllByOrderByBatchNoAsc();
-        Map<String, java.util.List<Batch>> grouped = new java.util.LinkedHashMap<>();
+        Map<String, List<Batch>> grouped = new java.util.LinkedHashMap<>();
         for (String s : List.of("PLAN", "MASH", "BOIL", "FERMENT", "CONDITION", "PACKAGED", "SCRAPPED")) {
             grouped.put(s, new ArrayList<>());
         }
@@ -226,7 +276,7 @@ public class BatchService {
         Views.BatchSummary summary = new Views.BatchSummary();
         BigDecimal total = BigDecimal.ZERO;
         BigDecimal packaged = BigDecimal.ZERO;
-        for (Map.Entry<String, java.util.List<Batch>> e : grouped.entrySet()) {
+        for (Map.Entry<String, List<Batch>> e : grouped.entrySet()) {
             BigDecimal sum = BigDecimal.ZERO;
             for (Batch b : e.getValue()) {
                 sum = sum.add(b.getVolumeL() == null ? BigDecimal.ZERO : b.getVolumeL());

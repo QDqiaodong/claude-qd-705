@@ -50,6 +50,14 @@ export const batchApi = {
   reading: (id, dayKey) => http.get(`/batches/${id}/readings/${dayKey}`)
 }
 
+/** 模块六：批次质检放行（送检/放行/驳回/撤销/复检历史） */
+export const qcApi = {
+  profile: (batchId) => http.get(`/batches/${batchId}/qc`),
+  openRound: (batchId, data) => http.post(`/batches/${batchId}/qc/rounds`, data),
+  decide: (batchId, roundId, data) => http.post(`/batches/${batchId}/qc/rounds/${roundId}/decision`, data),
+  revoke: (batchId, roundId, data) => http.post(`/batches/${batchId}/qc/rounds/${roundId}/revoke`, data)
+}
+
 /** 模块三：配方与原料用量（Map<String, RecipeItem> 的增删改查） */
 export const recipeApi = {
   list: () => http.get('/recipes'),

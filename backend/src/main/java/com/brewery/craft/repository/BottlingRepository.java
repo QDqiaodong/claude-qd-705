@@ -16,4 +16,6 @@ public interface BottlingRepository extends JpaRepository<Bottling, Long> {
     boolean existsByBottlingNo(String bottlingNo);
 
     List<Bottling> findAllByBatchNoOrderByIdAsc(String batchNo);
+
+    List<Bottling> findAllByBatchNoAndPackageFormOrderByIdAsc(String batchNo, String packageForm);
 }

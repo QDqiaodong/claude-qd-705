@@ -12,6 +12,9 @@ import com.brewery.craft.domain.Batch;
 import com.brewery.craft.domain.Bottling;
 import com.brewery.craft.domain.Fermenter;
 import com.brewery.craft.domain.Ingredient;
+import com.brewery.craft.domain.QcAction;
+import com.brewery.craft.domain.QcReading;
+import com.brewery.craft.domain.QcRound;
 import com.brewery.craft.domain.Recipe;
 import com.brewery.craft.domain.RecipeItem;
 import com.brewery.craft.domain.Shipment;
@@ -148,14 +151,48 @@ public final class Views {
             "KEG", "桶");
 
     // ---------------- 出货状态 ----------------
-    private static final Map<String, String> SHIPMENT_STATUS = Map.of(
-            "PENDING", "待发",
-            "SHIPPED", "已发",
-            "PAID", "已结款");
+    private static final Map<String, String> SHIPMENT_STATUS = Map.ofEntries(
+            Map.entry("PENDING", "待发"),
+            Map.entry("FROZEN", "冻结"),
+            Map.entry("SHIPPED", "已发"),
+            Map.entry("PAID", "已结款"));
 
     private static final Map<String, String> SHIPMENT_NEXT = Map.of(
             "PENDING", "SHIPPED",
             "SHIPPED", "PAID");
+
+    // ---------------- 质检有效状态（由最新轮次推导） ----------------
+    private static final Map<String, String> QC_STATUS = Map.of(
+            "NONE", "待质检",
+            "PENDING", "待质检",
+            "REINSPECT", "复检中",
+            "PASS", "已放行",
+            "REJECT", "已驳回",
+            "REVOKED", "已撤销");
+
+    private static final Map<String, String> QC_ROUND_STATUS = Map.of(
+            "PENDING", "检验中",
+            "PASS", "放行",
+            "REJECT", "驳回",
+            "REVOKED", "已撤销");
+
+    private static final Map<String, String> QC_ACTION = Map.of(
+            "SUBMIT", "送检",
+            "PASS", "通过放行",
+            "REJECT", "驳回",
+            "REVOKE", "撤销放行");
+
+    public static String qcStatusName(String v) {
+        return QC_STATUS.getOrDefault(v, v == null ? "" : v);
+    }
+
+    public static String qcRoundStatusName(String v) {
+        return QC_ROUND_STATUS.getOrDefault(v, v == null ? "" : v);
+    }
+
+    public static String qcActionName(String v) {
+        return QC_ACTION.getOrDefault(v, v == null ? "" : v);
+    }
 
     // ---------------- 词典取值 ----------------
     public static String materialName(String v) {
@@ -306,6 +343,15 @@ public final class Views {
         private String statusName;
         private String nextStatus;
         private String nextStatusName;
+        /** 质检有效状态：NONE/PENDING/REINSPECT/PASS/REJECT/REVOKED */
+        private String qcStatus;
+        private String qcStatusName;
+        /** 质检最新轮序号（null = 尚未送检） */
+        private Integer qcRoundSeq;
+        /** 最新有效结论的原因/说明（撤销/驳回原因、放行说明） */
+        private String qcReason;
+        /** 质检轮数 */
+        private long qcRoundCount;
         /** 工艺时间线（由各阶段时间字段拼成） */
         private List<TimelineNode> timeline = new ArrayList<>();
         /** @ElementCollection Map 逐日温度/糖度曲线 */
@@ -313,6 +359,13 @@ public final class Views {
         private LocalDateTime updatedAt;
 
         public static BatchView of(Batch e, String recipeName) {
+            return of(e, recipeName, null);
+        }
+
+        /**
+         * @param qc 当前批次的质检状态；列表场景可传 null（不额外查库，前端可再拉详情）
+         */
+        public static BatchView of(Batch e, String recipeName, BatchQcStateView qc) {
             BatchView v = new BatchView();
             v.setId(e.getId());
             v.setBatchNo(e.getBatchNo());
@@ -336,6 +389,13 @@ public final class Views {
             String next = batchNextStatus(e.getStatus());
             v.setNextStatus(next);
             v.setNextStatusName(next == null ? "" : batchStatusName(next));
+            if (qc != null) {
+                v.setQcStatus(qc.getStatus());
+                v.setQcStatusName(qc.getStatusName());
+                v.setQcRoundSeq(qc.getRoundSeq());
+                v.setQcReason(qc.getReason());
+                v.setQcRoundCount(qc.getRoundCount());
+            }
             v.buildTimeline();
             v.buildCurve(e);
             v.setUpdatedAt(e.getUpdatedAt());
@@ -398,6 +458,160 @@ public final class Views {
         private long batchTotal;
         private BigDecimal volumeTotal;
         private BigDecimal packagedVolume;
+    }
+
+    // ---------------- 模块六：质检 ----------------
+    @Data
+    public static class BatchQcStateView {
+
+        private String status;
+        private String statusName;
+        private Integer roundSeq;
+        private String reason;
+        private long roundCount;
+        /** 放行轮版本（前端撤销/下结论时做乐观锁校验） */
+        private Integer version;
+
+        public static BatchQcStateView of(String code, QcRound latest, String reason, long roundCount) {
+            BatchQcStateView v = new BatchQcStateView();
+            v.setStatus(code);
+            v.setStatusName(qcStatusName(code));
+            v.setRoundSeq(latest == null ? null : latest.getRoundSeq());
+            v.setReason(reason);
+            v.setRoundCount(roundCount);
+            v.setVersion(latest == null ? null : latest.getVersion());
+            return v;
+        }
+    }
+
+    @Data
+    public static class QcReadingView {
+
+        private String dayKey;
+        private BigDecimal temp;
+        private BigDecimal gravity;
+
+        public static QcReadingView of(QcReading r) {
+            QcReadingView v = new QcReadingView();
+            v.setDayKey(r.getDayKey());
+            v.setTemp(r.getTemp());
+            v.setGravity(r.getGravity());
+            return v;
+        }
+    }
+
+    @Data
+    public static class QcRoundView {
+
+        private Long id;
+        private Long batchId;
+        private String batchNo;
+        private Integer roundSeq;
+        private String status;
+        private String statusName;
+        private String batchStatusSnapshot;
+        private String batchStatusSnapshotName;
+        private BigDecimal abv;
+        private String sensory;
+        private String conclusionNote;
+        private String submittedBy;
+        private LocalDateTime submittedAt;
+        private String decidedBy;
+        private LocalDateTime decidedAt;
+        private String revokedBy;
+        private LocalDateTime revokedAt;
+        private String revokeReason;
+        private Integer version;
+        private List<QcReadingView> readings = new ArrayList<>();
+
+        public static QcRoundView of(QcRound e) {
+            QcRoundView v = new QcRoundView();
+            v.setId(e.getId());
+            v.setBatchId(e.getBatchId());
+            v.setBatchNo(e.getBatchNo());
+            v.setRoundSeq(e.getRoundSeq());
+            v.setStatus(e.getStatus());
+            v.setStatusName(qcRoundStatusName(e.getStatus()));
+            v.setBatchStatusSnapshot(e.getBatchStatusSnapshot());
+            v.setBatchStatusSnapshotName(batchStatusName(e.getBatchStatusSnapshot()));
+            v.setAbv(e.getAbv());
+            v.setSensory(e.getSensory());
+            v.setConclusionNote(e.getConclusionNote());
+            v.setSubmittedBy(e.getSubmittedBy());
+            v.setSubmittedAt(e.getSubmittedAt());
+            v.setDecidedBy(e.getDecidedBy());
+            v.setDecidedAt(e.getDecidedAt());
+            v.setRevokedBy(e.getRevokedBy());
+            v.setRevokedAt(e.getRevokedAt());
+            v.setRevokeReason(e.getRevokeReason());
+            v.setVersion(e.getVersion());
+            if (e.getReadings() != null) {
+                for (QcReading r : e.getReadings()) {
+                    v.getReadings().add(QcReadingView.of(r));
+                }
+            }
+            return v;
+        }
+    }
+
+    @Data
+    public static class QcActionView {
+
+        private Long id;
+        private Long roundId;
+        private Integer roundSeq;
+        private String action;
+        private String actionName;
+        private String conclusion;
+        private String operator;
+        private String reason;
+        private LocalDateTime createdAt;
+
+        public static QcActionView of(QcAction e) {
+            QcActionView v = new QcActionView();
+            v.setId(e.getId());
+            v.setRoundId(e.getRoundId());
+            v.setRoundSeq(e.getRoundSeq());
+            v.setAction(e.getAction());
+            v.setActionName(qcActionName(e.getAction()));
+            v.setConclusion(e.getConclusion());
+            v.setOperator(e.getOperator());
+            v.setReason(e.getReason());
+            v.setCreatedAt(e.getCreatedAt());
+            return v;
+        }
+    }
+
+    /** 批次质检档案：当前有效状态 + 历史轮次（含测量快照）+ 操作流水 */
+    @Data
+    public static class BatchQcView {
+
+        private Long batchId;
+        private String batchNo;
+        private String batchStatus;
+        private String batchStatusName;
+        private BatchQcStateView current;
+        private List<QcRoundView> rounds = new ArrayList<>();
+        private List<QcActionView> actions = new ArrayList<>();
+
+        public static BatchQcView of(Batch b,
+                                     com.brewery.craft.service.QcGate.QcState state,
+                                     List<QcRound> roundEntities,
+                                     List<QcAction> actionEntities) {
+            BatchQcView v = new BatchQcView();
+            v.setBatchId(b.getId());
+            v.setBatchNo(b.getBatchNo());
+            v.setBatchStatus(b.getStatus());
+            v.setBatchStatusName(batchStatusName(b.getStatus()));
+            v.setCurrent(BatchQcStateView.of(state.code, state.latestRound, state.reason, state.roundCount));
+            for (QcRound r : roundEntities) {
+                v.getRounds().add(QcRoundView.of(r));
+            }
+            for (QcAction a : actionEntities) {
+                v.getActions().add(QcActionView.of(a));
+            }
+            return v;
+        }
     }
 
     @Data
@@ -564,9 +778,19 @@ public final class Views {
         private Integer quantity;
         private LocalDate bottleDate;
         private BigDecimal lossL;
+        /** 灌装时该批次的质检有效状态 */
+        private String qcStatus;
+        private String qcStatusName;
+        private String qcReason;
+        private String batchStatus;
+        private String batchStatusName;
         private LocalDateTime updatedAt;
 
         public static BottlingView of(Bottling e) {
+            return of(e, null, null, null);
+        }
+
+        public static BottlingView of(Bottling e, String qcStatus, String qcReason, String batchStatus) {
             BottlingView v = new BottlingView();
             v.setId(e.getId());
             v.setBottlingNo(e.getBottlingNo());
@@ -576,6 +800,11 @@ public final class Views {
             v.setQuantity(e.getQuantity());
             v.setBottleDate(e.getBottleDate());
             v.setLossL(e.getLossL());
+            v.setQcStatus(qcStatus);
+            v.setQcStatusName(qcStatus == null ? "" : qcStatusName(qcStatus));
+            v.setQcReason(qcReason);
+            v.setBatchStatus(batchStatus);
+            v.setBatchStatusName(batchStatus == null ? "" : batchStatusName(batchStatus));
             v.setUpdatedAt(e.getUpdatedAt());
             return v;
         }
@@ -598,9 +827,25 @@ public final class Views {
         private String statusName;
         private String nextStatus;
         private String nextStatusName;
+        /** 冻结原因 / 质检状态说明（非冻结时为当前批次质检结论说明） */
+        private String frozenReason;
+        private LocalDateTime frozenAt;
+        private Integer frozenRoundSeq;
+        /** 该批次当前的质检有效状态 */
+        private String qcStatus;
+        private String qcStatusName;
+        private String qcReason;
+        private String batchStatus;
+        private String batchStatusName;
+        /** 出货推进被阻止时的业务原因（FROZEN/放行失效等） */
+        private String blockedReason;
         private LocalDateTime updatedAt;
 
         public static ShipmentView of(Shipment e) {
+            return of(e, null, null, null);
+        }
+
+        public static ShipmentView of(Shipment e, String qcStatus, String qcReason, String batchStatus) {
             ShipmentView v = new ShipmentView();
             v.setId(e.getId());
             v.setShipmentNo(e.getShipmentNo());
@@ -617,6 +862,17 @@ public final class Views {
             String next = shipmentNextStatus(e.getStatus());
             v.setNextStatus(next);
             v.setNextStatusName(next == null ? "" : shipmentStatusName(next));
+            v.setFrozenReason(e.getFrozenReason());
+            v.setFrozenAt(e.getFrozenAt());
+            v.setFrozenRoundSeq(e.getFrozenRoundSeq());
+            v.setQcStatus(qcStatus);
+            v.setQcStatusName(qcStatus == null ? "" : qcStatusName(qcStatus));
+            v.setQcReason(qcReason);
+            v.setBatchStatus(batchStatus);
+            v.setBatchStatusName(batchStatus == null ? "" : batchStatusName(batchStatus));
+            if ("FROZEN".equals(e.getStatus())) {
+                v.setBlockedReason(e.getFrozenReason());
+            }
             v.setUpdatedAt(e.getUpdatedAt());
             return v;
         }
@@ -640,6 +896,7 @@ public final class Views {
         private long quantityTotal;
         private BigDecimal amountTotal;
         private BigDecimal paidAmount;
+        private long frozenCount;
     }
 
     @Data
