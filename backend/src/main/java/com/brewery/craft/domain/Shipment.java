@@ -57,6 +57,22 @@ public class Shipment {
     @Column(name = "status", nullable = false, length = 16)
     private String status;
 
+    /** 创建出货时确认的放行轮次 id（快照） */
+    @Column(name = "qc_round_id")
+    private Long qcRoundId;
+
+    /** 是否被质检冻结：撤销放行/复检中/驳回时冻结待发出货，重新放行后解冻 */
+    @Column(name = "frozen", nullable = false)
+    private Boolean frozen = false;
+
+    /** 冻结原因（撤销/复检/驳回的业务原因） */
+    @Column(name = "frozen_reason", length = 512)
+    private String frozenReason;
+
+    /** 最近一次冻结时间 */
+    @Column(name = "frozen_at")
+    private LocalDateTime frozenAt;
+
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 }

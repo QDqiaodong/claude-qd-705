@@ -2,19 +2,27 @@
 -- 精酿啤酒工坊 · 酿造运营平台 建表 + 种子数据
 -- 库名 brewery_craft，由 mysql 镜像的 docker-entrypoint 在【镜像构建期】执行一次。
 --
--- 五个业务模块：
+-- 六个业务模块：
 --   1. fermenter                发酵罐（罐号/容量/材质/温控区间/冷却方式/状态/当前批次）
 --   2. batch                    啤酒批次（计划→糖化→煮沸→发酵→熟成→已灌装/报废）
 --        batch_temp_reading     【@ElementCollection + @MapKeyColumn】逐日温度
 --        batch_gravity_reading  【@ElementCollection + @MapKeyColumn】逐日糖度
+--        batch_qc_round          批次质检轮次（只增不改：送检/复检/驳回/放行/撤销全程留痕）
 --   3. recipe / recipe_item     配方 + 原料用量明细
 --        recipe_item_slot        Recipe.items 这张 Map 的 key 表（@OneToMany + @MapKeyColumn）
 --   4. ingredient               原料库存（麦芽/啤酒花/酵母/辅料/水处理剂）
---   5. bottling / shipment      灌装单 + 出货单
+--   5. bottling / shipment      灌装单 + 出货单（受质检放行硬约束；撤销放行会冻结待发出货）
+--
+-- 质检链设计口径：
+--   * batch_qc_round 只 INSERT / 更新本行终态，绝不删除、绝不覆盖已提交内容；
+--     复检 = 新开一轮，旧轮原样保留；batch.latest_qc_id 指向当前有效轮次。
+--   * uk_qc_open_round 保证同一批次至多一轮 OPEN（送检中），重复点击/网络重试
+--     不会产生重复轮次。
+--   * 撤销放行必须填原因，撤销后冻结该批次全部待发出货（shipment.frozen=1），
+--     重新放行后自动解冻；已发/已结款历史单据不回写、不改写。
 --
 -- 种子数据对照：
 --   [M1] 七种罐体状态齐活    → MASHING×1 BOILING×1 FERMENTING×3 CONDITIONING×2 CLEANING×1 IDLE×3 DISABLED×1，共 12 罐
---   [M1] 液位按产量/罐容     → FK-02 75%（BC-2026-102 1500L / 2000L）
 --   [M2] 批次七种状态齐活    → PLAN×2 MASH×1 BOIL×1 FERMENT×3 CONDITION×2 PACKAGED×3 SCRAPPED×1，共 13 批
 --   [M3] Map 用量明细        → 每个配方 4~6 个投放阶段，key 各不相同（BOIL_60 / DRYHOP_1 …）
 --   [M4] 低库存标红          → HOP-CIT 18<25、YEAST-W34 24<30、ADJ-CORI 9<12 共 3 条
@@ -26,6 +34,7 @@ SET FOREIGN_KEY_CHECKS = 0;
 
 DROP TABLE IF EXISTS batch_temp_reading;
 DROP TABLE IF EXISTS batch_gravity_reading;
+DROP TABLE IF EXISTS batch_qc_round;
 DROP TABLE IF EXISTS recipe_item_slot;
 DROP TABLE IF EXISTS recipe_item;
 DROP TABLE IF EXISTS shipment;
@@ -108,6 +117,8 @@ CREATE TABLE batch (
     ibu             DECIMAL(5,1)           COMMENT '苦度 IBU',
     ebc             DECIMAL(5,1)           COMMENT '色度 EBC',
     status          VARCHAR(16)   NOT NULL COMMENT 'PLAN/MASH/BOIL/FERMENT/CONDITION/PACKAGED/SCRAPPED',
+    latest_qc_id    BIGINT                 COMMENT '当前有效质检轮次 id（历史不可篡改，只改指针）',
+    qc_version      INT           NOT NULL DEFAULT 0 COMMENT '乐观锁：放行/撤销/复检与下游操作互斥用',
     updated_at      DATETIME,
     PRIMARY KEY (id),
     UNIQUE KEY uk_batch_no (batch_no),
@@ -129,6 +140,38 @@ CREATE TABLE batch_gravity_reading (
     day_key       VARCHAR(16)  NOT NULL COMMENT '第 N 天 = Map 的 key',
     gravity_value DECIMAL(5,2)          COMMENT '表观糖度（°P）',
     PRIMARY KEY (batch_id, day_key)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
+
+-- 批次质检轮次：一行 = 一轮质检。送检即开轮（OPEN），提交结论后落终态；
+-- 复检永远新开下一轮，旧轮【只追加、不覆盖、不删除】。
+--   result：OPEN 送检中 / PASSED 放行 / REJECTED 驳回 / REVOKED 已撤销放行
+--   流转：  OPEN ──提交──▶ PASSED ──撤销(必填原因)──▶ REVOKED
+--                  └──────▶ REJECTED
+--          PASSED/REJECTED/REVOKED 之后都只能「发起复检」→ 新的 OPEN 轮
+CREATE TABLE batch_qc_round (
+    id                  BIGINT        NOT NULL AUTO_INCREMENT,
+    batch_id            BIGINT        NOT NULL COMMENT '所属批次',
+    round_no            INT           NOT NULL COMMENT '轮次序号（同批次内 1,2,3…）',
+    batch_status        VARCHAR(16)   NOT NULL COMMENT '送检时批次状态快照',
+    inspector           VARCHAR(32)   NOT NULL COMMENT '送检/检验操作人',
+    submitted_by        VARCHAR(32)            COMMENT '提交结论操作人',
+    result              VARCHAR(16)   NOT NULL DEFAULT 'OPEN' COMMENT 'OPEN/PASSED/REJECTED/REVOKED',
+    qc_abv              DECIMAL(4,2)           COMMENT '检验酒精度 %vol',
+    sensory             VARCHAR(512)           COMMENT '感官结论（色/香/味/澄清度）',
+    reason              VARCHAR(512)           COMMENT '驳回/撤销/复检原因（撤销必填）',
+    readings_summary    VARCHAR(1024)          COMMENT '送检时逐日温度/糖度摘要快照（JSON 文本）',
+    opened_at           DATETIME      NOT NULL COMMENT '开轮（送检）时间',
+    submitted_at        DATETIME               COMMENT '提交放行/驳回时间',
+    revoked_at          DATETIME               COMMENT '撤销放行时间',
+    revoked_by          VARCHAR(32)            COMMENT '撤销放行操作人',
+    superseded_round_id BIGINT                 COMMENT '本轮回溯/复检自哪一轮（链式留痕）',
+    -- 同一批次至多存在一轮 OPEN：只有送检中行该列为 1，终态行为 NULL（唯一索引允许多个 NULL）。
+    -- 用存储生成列而非函数索引，规避非确定性排序规则（utf8mb4_unicode_ci）不能进函数索引的限制。
+    open_flag           TINYINT      GENERATED ALWAYS AS (CASE WHEN result = 'OPEN' THEN 1 ELSE NULL END) STORED COMMENT 'OPEN 唯一哨兵',
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_qc_round (batch_id, round_no),
+    UNIQUE KEY uk_qc_open_round (batch_id, open_flag),
+    KEY idx_qc_batch (batch_id)
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 -- ---------------- 模块四：原料库存 ----------------
@@ -157,6 +200,7 @@ CREATE TABLE bottling (
     quantity     INT           NOT NULL COMMENT '数量（瓶/罐/桶）',
     bottle_date  DATE                   COMMENT '灌装日期',
     loss_l       DECIMAL(10,2)          COMMENT '灌装损耗（L）',
+    qc_round_id  BIGINT                 COMMENT '放行本轮质检的轮次 id（创建灌装时快照）',
     updated_at   DATETIME,
     PRIMARY KEY (id),
     UNIQUE KEY uk_bottling_no (bottling_no),
@@ -164,17 +208,21 @@ CREATE TABLE bottling (
 ) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_unicode_ci;
 
 CREATE TABLE shipment (
-    id           BIGINT        NOT NULL AUTO_INCREMENT,
-    shipment_no  VARCHAR(24)   NOT NULL COMMENT '出货单号',
-    customer     VARCHAR(64)   NOT NULL COMMENT '客户',
-    batch_no     VARCHAR(24)   NOT NULL COMMENT '批次号',
-    package_form VARCHAR(16)   NOT NULL COMMENT 'BOTTLE/CAN/KEG',
-    quantity     INT           NOT NULL COMMENT '数量',
-    unit_price   DECIMAL(10,2) NOT NULL COMMENT '单价（元）',
-    amount       DECIMAL(12,2) NOT NULL COMMENT '金额 = 数量 × 单价',
-    ship_date    DATE                   COMMENT '出货日期',
-    status       VARCHAR(16)   NOT NULL COMMENT 'PENDING/SHIPPED/PAID',
-    updated_at   DATETIME,
+    id             BIGINT        NOT NULL AUTO_INCREMENT,
+    shipment_no    VARCHAR(24)   NOT NULL COMMENT '出货单号',
+    customer       VARCHAR(64)   NOT NULL COMMENT '客户',
+    batch_no       VARCHAR(24)   NOT NULL COMMENT '批次号',
+    package_form   VARCHAR(16)   NOT NULL COMMENT 'BOTTLE/CAN/KEG',
+    quantity       INT           NOT NULL COMMENT '数量',
+    unit_price     DECIMAL(10,2) NOT NULL COMMENT '单价（元）',
+    amount         DECIMAL(12,2) NOT NULL COMMENT '金额 = 数量 × 单价',
+    ship_date      DATE                   COMMENT '出货日期',
+    status         VARCHAR(16)   NOT NULL COMMENT 'PENDING/SHIPPED/PAID',
+    qc_round_id    BIGINT                 COMMENT '创建出货时所确认的放行轮次 id 快照',
+    frozen         TINYINT(1)    NOT NULL DEFAULT 0 COMMENT '是否被质检冻结：0 否 1 是（撤销放行冻结，重新放行解冻）',
+    frozen_reason  VARCHAR(512)           COMMENT '冻结原因（撤销放行原因）',
+    frozen_at      DATETIME               COMMENT '最近一次冻结时间',
+    updated_at     DATETIME,
     PRIMARY KEY (id),
     UNIQUE KEY uk_shipment_no (shipment_no),
     KEY idx_shipment_batch (batch_no)
@@ -415,5 +463,56 @@ INSERT INTO shipment (id, shipment_no, customer, batch_no, package_form, quantit
 (10, 'SH-2026-10', '麦浪餐吧',       'BC-2026-107', 'CAN',    280, 16.50,  4620.00, '2026-09-22', 'PENDING', NOW()),
 (11, 'SH-2026-11', '夜航西飞酒吧',   'BC-2026-103', 'KEG',     14, 660.00, 9240.00, '2026-09-23', 'PENDING', NOW()),
 (12, 'SH-2026-12', '啤氣酒馆',       'BC-2026-104', 'BOTTLE', 360, 18.80,  6768.00, '2026-09-24', 'PENDING', NOW());
+
+-- ---------------- 2. 批次质检轮次（10 条：覆盖 待质检/复检中/已驳回/已放行/已撤销 五种当前态） ----------------
+-- 108/109/110 已灌装已放行（历史出货已发/已结款）；106 熟成中已放行；
+-- 103 首轮放行、第二轮【复检中】；104 首轮放行、第二轮【已驳回】；107 放行后【已撤销】。
+INSERT INTO batch_qc_round
+(id, batch_id, round_no, batch_status, inspector, submitted_by, result, qc_abv, sensory, reason, readings_summary, opened_at, submitted_at, revoked_at, revoked_by, superseded_round_id) VALUES
+(1,  8,  1, 'CONDITION', '李承泽', '李承泽', 'PASSED', 5.50, '色泽深红透亮，樱桃果香突出，酸度柔和，无杂味', NULL,
+     '{"days":6,"tempFirst":22.50,"tempLast":20.20,"gravityFirst":13.60,"gravityLast":3.90}', '2026-08-24 09:00:00', '2026-08-25 15:30:00', NULL, NULL, NULL),
+(2,  9,  1, 'CONDITION', '周敏',   '周敏',   'PASSED', 4.40, '浅麦秆色，柠檬皮香气清爽，咸感收敛，杀口正常', NULL,
+     '{"days":5,"tempFirst":21.80,"tempLast":20.80,"gravityFirst":11.40,"gravityLast":3.90}', '2026-08-29 09:00:00', '2026-08-30 14:00:00', NULL, NULL, NULL),
+(3,  10, 1, 'CONDITION', '王海涛', '王海涛', 'PASSED', 5.40, '琥珀色清亮，柑橘松针香协调，苦度干净，口感干爽', NULL,
+     '{"days":6,"tempFirst":18.60,"tempLast":18.20,"gravityFirst":13.20,"gravityLast":4.00}', '2026-09-04 09:00:00', '2026-09-05 16:00:00', NULL, NULL, NULL),
+(4,  6,  1, 'CONDITION', '王海涛', '王海涛', 'PASSED', 7.90, '深褐近黑，咖啡与燕麦奶香，酒体顺滑，气泡细腻', NULL,
+     '{"days":6,"tempFirst":2.00,"tempLast":1.00,"gravityFirst":6.80,"gravityLast":3.80}',  '2026-09-18 09:30:00', '2026-09-19 15:00:00', NULL, NULL, NULL),
+(5,  7,  1, 'CONDITION', '周敏',   '周敏',   'PASSED', 4.90, '乳白浑浊，芫荽与陈皮清香，丁香香蕉味典型', NULL,
+     '{"days":6,"tempFirst":3.20,"tempLast":1.20,"gravityFirst":6.20,"gravityLast":3.70}',  '2026-09-16 09:00:00', '2026-09-17 14:30:00', NULL, NULL, NULL),
+(6,  7,  2, 'CONDITION', '周敏',   '周敏',   'REVOKED', 4.90, '乳白浑浊，芫荽与陈皮清香，丁香香蕉味典型', '客户投诉两桶有轻微氧化纸板味，暂停发货等待复检',
+     '{"days":6,"tempFirst":3.20,"tempLast":1.20,"gravityFirst":6.20,"gravityLast":3.70}',  '2026-09-16 09:00:00', '2026-09-17 14:30:00', '2026-09-25 10:20:00', '周敏', NULL),
+(7,  3,  1, 'CONDITION', '陈墨',   '陈墨',   'PASSED', 8.10, '浑浊橙黄，热带水果香气浓郁，松针苦尾，口感多汁', NULL,
+     '{"days":7,"tempFirst":18.80,"tempLast":19.10,"gravityFirst":16.20,"gravityLast":4.10}', '2026-09-24 09:00:00', '2026-09-25 16:00:00', NULL, NULL, NULL),
+(8,  3,  2, 'FERMENT',   '陈墨',   NULL,      'OPEN',   NULL, NULL, '留样复查发现干投酒花香衰减偏快，开复检轮核对',
+     '{"days":7,"tempFirst":18.80,"tempLast":19.10,"gravityFirst":16.20,"gravityLast":4.10}', '2026-09-28 09:40:00', NULL, NULL, NULL, 7),
+(9,  4,  1, 'CONDITION', '陈墨',   '陈墨',   'PASSED', 7.00, '黑色不透光，焦香麦芽与深色果脯香，收口微甜', NULL,
+     '{"days":6,"tempFirst":18.50,"tempLast":19.20,"gravityFirst":15.40,"gravityLast":5.00}', '2026-09-20 09:00:00', '2026-09-20 17:00:00', NULL, NULL, NULL),
+(10, 4,  2, 'FERMENT',   '陈墨',   '陈墨',   'REJECTED', 6.60, '色泽偏淡，焦香不足，入口有水渍感，与目标风格偏差明显', '复测发酵度不达标且感官打分不合格，驳回，安排重新处理方案',
+     '{"days":6,"tempFirst":18.50,"tempLast":19.20,"gravityFirst":15.40,"gravityLast":5.00}', '2026-09-26 10:00:00', '2026-09-28 11:00:00', NULL, NULL, 7);
+
+-- 当前有效轮次指针 + 乐观锁版本号
+UPDATE batch SET latest_qc_id = 1, qc_version = 2 WHERE id = 8;
+UPDATE batch SET latest_qc_id = 2, qc_version = 2 WHERE id = 9;
+UPDATE batch SET latest_qc_id = 3, qc_version = 2 WHERE id = 10;
+UPDATE batch SET latest_qc_id = 4, qc_version = 2 WHERE id = 6;
+UPDATE batch SET latest_qc_id = 6, qc_version = 3 WHERE id = 7;
+UPDATE batch SET latest_qc_id = 8, qc_version = 3 WHERE id = 3;
+UPDATE batch SET latest_qc_id = 10, qc_version = 3 WHERE id = 4;
+
+-- 历史灌装单回溯到当时的放行轮次（103/104/107 均为首轮放行后灌装，撤销/复检不抹历史）
+UPDATE bottling SET qc_round_id = 1 WHERE batch_no = 'BC-2026-108';
+UPDATE bottling SET qc_round_id = 2 WHERE batch_no = 'BC-2026-109';
+UPDATE bottling SET qc_round_id = 3 WHERE batch_no = 'BC-2026-110';
+UPDATE bottling SET qc_round_id = 4 WHERE batch_no = 'BC-2026-106';
+UPDATE bottling SET qc_round_id = 5 WHERE batch_no = 'BC-2026-107';
+UPDATE bottling SET qc_round_id = 7 WHERE batch_no = 'BC-2026-103';
+UPDATE bottling SET qc_round_id = 9 WHERE batch_no = 'BC-2026-104';
+
+-- 待发出货：创建时确认的放行轮次；107 已撤销 / 103 复检中 / 104 已驳回 → 冻结
+UPDATE shipment SET qc_round_id = 3 WHERE batch_no = 'BC-2026-110';
+UPDATE shipment SET qc_round_id = 4, frozen = 0 WHERE batch_no = 'BC-2026-106';
+UPDATE shipment SET qc_round_id = 5, frozen = 1, frozen_reason = '客户投诉两桶有轻微氧化纸板味，暂停发货等待复检', frozen_at = '2026-09-25 10:20:00' WHERE id = 10;
+UPDATE shipment SET qc_round_id = 7, frozen = 1, frozen_reason = '批次 BC-2026-103 已进入复检中，待重新放行后方可发货', frozen_at = '2026-09-28 09:40:00' WHERE id = 11;
+UPDATE shipment SET qc_round_id = 9, frozen = 1, frozen_reason = '批次 BC-2026-104 最新质检结论：驳回（复测发酵度不达标且感官打分不合格）', frozen_at = '2026-09-28 11:00:00' WHERE id = 12;
 
 SET FOREIGN_KEY_CHECKS = 1;

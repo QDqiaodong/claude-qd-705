@@ -50,6 +50,18 @@ export const batchApi = {
   reading: (id, dayKey) => http.get(`/batches/${id}/readings/${dayKey}`)
 }
 
+/** 批次质检放行链：送检/复检 → 提交放行或驳回 → 撤销放行（全程留痕，历史不可改） */
+export const qcApi = {
+  /** 当前有效结论 + 全部历史轮次 */
+  detail: (batchId) => http.get(`/batches/${batchId}/qc`),
+  /** 发起一轮质检（再次发起即为复检） */
+  open: (batchId, data) => http.post(`/batches/${batchId}/qc/rounds`, data),
+  /** 提交本轮结论：verdict = PASS / REJECT */
+  submit: (batchId, data) => http.post(`/batches/${batchId}/qc/submit`, data),
+  /** 撤销放行（reason 必填） */
+  revoke: (batchId, data) => http.post(`/batches/${batchId}/qc/revoke`, data)
+}
+
 /** 模块三：配方与原料用量（Map<String, RecipeItem> 的增删改查） */
 export const recipeApi = {
   list: () => http.get('/recipes'),

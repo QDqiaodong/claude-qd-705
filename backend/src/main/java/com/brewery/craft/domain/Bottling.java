@@ -45,6 +45,10 @@ public class Bottling {
     @Column(name = "loss_l", precision = 10, scale = 2)
     private BigDecimal lossL;
 
+    /** 创建灌装时所依据的放行轮次 id（快照，事后撤销/复检不回写） */
+    @Column(name = "qc_round_id")
+    private Long qcRoundId;
+
     @Column(name = "updated_at")
     private LocalDateTime updatedAt;
 }

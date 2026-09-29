@@ -85,6 +85,19 @@ public class Batch {
     @Column(name = "status", nullable = false, length = 16)
     private String status;
 
+    /** 当前有效质检轮次 id（历史不可篡改，复检/撤销只移动这个指针） */
+    @Column(name = "latest_qc_id")
+    private Long latestQcId;
+
+    /**
+     * 质检状态版本号（手工维护，只在开轮/提交/撤销时 +1）：
+     * 前端详情提交时带回，过期详情、网络重试与重复点击会因版本不符被拒绝。
+     * 注意不用 JPA @Version —— 罐体指派等与质检无关的批次更新不应让打开中的质检表单失效；
+     * QC 操作与灌装/出货之间的真正互斥由批次行悲观锁（findByIdForUpdate）保证。
+     */
+    @Column(name = "qc_version", nullable = false)
+    private Integer qcVersion = 0;
+
     /**
      * 【@ElementCollection + @MapKeyColumn】发酵期逐日温度曲线：key = D1/D2…，value = 温度（℃）。
      */

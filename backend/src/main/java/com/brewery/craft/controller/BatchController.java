@@ -44,7 +44,8 @@ public class BatchController {
 
     @GetMapping("/{id}")
     public ApiResponse<Views.BatchView> get(@PathVariable("id") Long id) {
-        return ApiResponse.success(batchService.get(id));
+        // 详情带全部质检轮次历史；当前能否继续生产只看最新有效轮
+        return ApiResponse.success(batchService.getWithRounds(id));
     }
 
     @PostMapping

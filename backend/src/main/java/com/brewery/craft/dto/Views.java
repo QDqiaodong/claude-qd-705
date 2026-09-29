@@ -12,6 +12,7 @@ import com.brewery.craft.domain.Batch;
 import com.brewery.craft.domain.Bottling;
 import com.brewery.craft.domain.Fermenter;
 import com.brewery.craft.domain.Ingredient;
+import com.brewery.craft.domain.QcRound;
 import com.brewery.craft.domain.Recipe;
 import com.brewery.craft.domain.RecipeItem;
 import com.brewery.craft.domain.Shipment;
@@ -157,6 +158,30 @@ public final class Views {
             "PENDING", "SHIPPED",
             "SHIPPED", "PAID");
 
+    // ---------------- 质检轮次结论（一行一轮，只增不改） ----------------
+    private static final Map<String, String> QC_RESULT = Map.of(
+            "OPEN", "送检中",
+            "PASSED", "放行",
+            "REJECTED", "驳回",
+            "REVOKED", "已撤销");
+
+    /** 当前有效质检态（按最新轮次派生） */
+    private static final Map<String, String> QC_STATE = Map.of(
+            "NONE", "待质检",
+            "OPEN", "待质检",
+            "RECHECK", "复检中",
+            "PASSED", "已放行",
+            "REJECTED", "已驳回",
+            "REVOKED", "已撤销");
+
+    private static final Map<String, String> QC_STATE_COLOR = Map.of(
+            "NONE", "#9aa5ab",
+            "OPEN", "#ef9b52",
+            "RECHECK", "#d99a2b",
+            "PASSED", "#4b8a25",
+            "REJECTED", "#c0392b",
+            "REVOKED", "#7a4e9e");
+
     // ---------------- 词典取值 ----------------
     public static String materialName(String v) {
         return MATERIAL.getOrDefault(v, v == null ? "" : v);
@@ -212,6 +237,18 @@ public final class Views {
 
     public static String shipmentNextStatus(String v) {
         return SHIPMENT_NEXT.get(v);
+    }
+
+    public static String qcResultName(String v) {
+        return QC_RESULT.getOrDefault(v, v == null ? "" : v);
+    }
+
+    public static String qcStateName(String v) {
+        return QC_STATE.getOrDefault(v, v == null ? "" : v);
+    }
+
+    public static String qcStateColor(String v) {
+        return QC_STATE_COLOR.getOrDefault(v, "#8d9aa5");
     }
 
     /** "D1" "D10" 这类 Day key 按数字排序 */
@@ -282,6 +319,58 @@ public final class Views {
         private BigDecimal gravity;
     }
 
+    /** 一轮质检的只读视图（历史轮次同样用它渲染，任何字段都不允许页面回写） */
+    @Data
+    public static class QcRoundView {
+
+        private Long id;
+        private Long batchId;
+        private Integer roundNo;
+        private String batchStatus;
+        private String batchStatusName;
+        private String inspector;
+        private String submittedBy;
+        /** OPEN/PASSED/REJECTED/REVOKED */
+        private String result;
+        private String resultName;
+        private BigDecimal qcAbv;
+        private String sensory;
+        private String reason;
+        /** 送检时逐日温度/糖度摘要快照（JSON 原文，开轮后不随批次曲线变） */
+        private String readingsSummary;
+        private LocalDateTime openedAt;
+        private LocalDateTime submittedAt;
+        private LocalDateTime revokedAt;
+        private String revokedBy;
+        private Long supersededRoundId;
+        /** 是否当前有效轮次（批次指针指向它） */
+        private boolean latest;
+
+        public static QcRoundView of(QcRound e, boolean latest) {
+            QcRoundView v = new QcRoundView();
+            v.setId(e.getId());
+            v.setBatchId(e.getBatchId());
+            v.setRoundNo(e.getRoundNo());
+            v.setBatchStatus(e.getBatchStatus());
+            v.setBatchStatusName(batchStatusName(e.getBatchStatus()));
+            v.setInspector(e.getInspector());
+            v.setSubmittedBy(e.getSubmittedBy());
+            v.setResult(e.getResult());
+            v.setResultName(qcResultName(e.getResult()));
+            v.setQcAbv(e.getQcAbv());
+            v.setSensory(e.getSensory());
+            v.setReason(e.getReason());
+            v.setReadingsSummary(e.getReadingsSummary());
+            v.setOpenedAt(e.getOpenedAt());
+            v.setSubmittedAt(e.getSubmittedAt());
+            v.setRevokedAt(e.getRevokedAt());
+            v.setRevokedBy(e.getRevokedBy());
+            v.setSupersededRoundId(e.getSupersededRoundId());
+            v.setLatest(latest);
+            return v;
+        }
+    }
+
     @Data
     public static class BatchView {
 
@@ -306,6 +395,32 @@ public final class Views {
         private String statusName;
         private String nextStatus;
         private String nextStatusName;
+        // ---- 质检放行链（当前可操作状态：永远以最新有效轮次判定） ----
+        /** NONE/OPEN/RECHECK/PASSED/REJECTED/REVOKED */
+        private String qcState;
+        private String qcStateName;
+        private String qcStateColor;
+        /** 非空 = 当前不能继续灌装/出货/推进的业务原因（后端真实裁决，不是提示文字） */
+        private String qcBlockReason;
+        private Long latestQcRoundId;
+        private Integer latestQcRoundNo;
+        /** 最新一轮的结论人/时间/原因/酒精度/感官，列表页直接展示当前有效结论 */
+        private String latestQcResult;
+        private String latestQcResultName;
+        private String latestQcOperator;
+        private LocalDateTime latestQcAt;
+        private String latestQcReason;
+        private BigDecimal latestQcAbv;
+        private String latestQcSensory;
+        private Integer qcRoundCount;
+        /** 详情页：全部历史轮次（只增不改，复检不抹旧轮） */
+        private List<QcRoundView> qcRounds = new ArrayList<>();
+        /** 乐观锁版本，前端提交时原样带回做过期提交拦截 */
+        private Integer qcVersion;
+        /** 是否具备必要测量记录（温度+糖度至少各一条） */
+        private boolean readingsReady;
+        /** 是否处于可成熟状态 */
+        private boolean mature;
         /** 工艺时间线（由各阶段时间字段拼成） */
         private List<TimelineNode> timeline = new ArrayList<>();
         /** @ElementCollection Map 逐日温度/糖度曲线 */
@@ -313,6 +428,14 @@ public final class Views {
         private LocalDateTime updatedAt;
 
         public static BatchView of(Batch e, String recipeName) {
+            return of(e, recipeName, null, List.of());
+        }
+
+        /**
+         * @param latest 当前有效轮次（batch.latestQcId 指向的那轮，可能为 null）
+         * @param rounds 全部轮次（含历史），列表接口传空集合即可，详情接口传全量
+         */
+        public static BatchView of(Batch e, String recipeName, QcRound latest, List<QcRound> rounds) {
             BatchView v = new BatchView();
             v.setId(e.getId());
             v.setBatchNo(e.getBatchNo());
@@ -336,10 +459,55 @@ public final class Views {
             String next = batchNextStatus(e.getStatus());
             v.setNextStatus(next);
             v.setNextStatusName(next == null ? "" : batchStatusName(next));
+            v.setQcVersion(e.getQcVersion());
+            v.setMature(com.brewery.craft.service.QcGate.mature(e));
+            v.setReadingsReady(com.brewery.craft.service.QcGate.hasNecessaryReadings(e));
+            v.fillQc(e, latest, rounds);
             v.buildTimeline();
             v.buildCurve(e);
             v.setUpdatedAt(e.getUpdatedAt());
             return v;
+        }
+
+        private void fillQc(Batch e, QcRound latest, List<QcRound> rounds) {
+            com.brewery.craft.service.QcGate.QcState state = com.brewery.craft.service.QcGate.stateOf(latest);
+            String key = state.name();
+            qcState = key;
+            qcStateName = qcStateName(key);
+            qcStateColor = qcStateColor(key);
+            qcRoundCount = rounds.isEmpty()
+                    ? (latest == null ? 0 : (int) (latest.getRoundNo() == null ? 1 : latest.getRoundNo()))
+                    : rounds.size();
+            if (latest != null) {
+                latestQcRoundId = latest.getId();
+                latestQcRoundNo = latest.getRoundNo();
+                latestQcResult = latest.getResult();
+                latestQcResultName = qcResultName(latest.getResult());
+                latestQcReason = latest.getReason();
+                latestQcAbv = latest.getQcAbv();
+                latestQcSensory = latest.getSensory();
+                latestQcOperator = "REVOKED".equals(latest.getResult())
+                        ? latest.getRevokedBy()
+                        : (latest.getSubmittedBy() != null ? latest.getSubmittedBy() : latest.getInspector());
+                latestQcAt = latest.getRevokedAt() != null
+                        ? latest.getRevokedAt()
+                        : (latest.getSubmittedAt() != null ? latest.getSubmittedAt() : latest.getOpenedAt());
+            }
+            for (QcRound r : rounds) {
+                qcRounds.add(QcRoundView.of(r, latest != null && r.getId().equals(latest.getId())));
+            }
+            // 当前能否继续下游：批次报废 / 可成熟态 / 测量记录 / 最新放行，统一由裁决器给原因
+            if ("SCRAPPED".equals(e.getStatus())) {
+                qcBlockReason = "批次已报废";
+            } else if (com.brewery.craft.service.QcGate.mature(e)) {
+                String reason = com.brewery.craft.service.QcGate.qcBlockReason(latest);
+                if (reason == null && !com.brewery.craft.service.QcGate.hasNecessaryReadings(e)) {
+                    reason = "缺少必要的逐日温度/糖度测量记录";
+                }
+                qcBlockReason = reason;
+            } else {
+                qcBlockReason = "未进入可成熟（熟成）状态";
+            }
         }
 
         private void buildTimeline() {
@@ -564,9 +732,18 @@ public final class Views {
         private Integer quantity;
         private LocalDate bottleDate;
         private BigDecimal lossL;
+        private Long qcRoundId;
+        /** 创建灌装时该批次的质检态快照名（历史单不随后续撤销/复检改写） */
+        private String qcState;
+        private String qcStateName;
+        private String qcStateColor;
         private LocalDateTime updatedAt;
 
         public static BottlingView of(Bottling e) {
+            return of(e, "PASSED");
+        }
+
+        public static BottlingView of(Bottling e, String qcState) {
             BottlingView v = new BottlingView();
             v.setId(e.getId());
             v.setBottlingNo(e.getBottlingNo());
@@ -576,6 +753,10 @@ public final class Views {
             v.setQuantity(e.getQuantity());
             v.setBottleDate(e.getBottleDate());
             v.setLossL(e.getLossL());
+            v.setQcRoundId(e.getQcRoundId());
+            v.setQcState(qcState);
+            v.setQcStateName(qcStateName(qcState));
+            v.setQcStateColor(qcStateColor(qcState));
             v.setUpdatedAt(e.getUpdatedAt());
             return v;
         }
@@ -598,9 +779,22 @@ public final class Views {
         private String statusName;
         private String nextStatus;
         private String nextStatusName;
+        private Long qcRoundId;
+        /** 批次当前质检态（用于列表醒目标注 待质检/复检中/已驳回/已放行/已撤销） */
+        private String qcState;
+        private String qcStateName;
+        private String qcStateColor;
+        /** 撤销放行/复检/驳回导致的冻结：PENDING 单被挂起，重新放行才恢复 */
+        private boolean frozen;
+        private String frozenReason;
+        private LocalDateTime frozenAt;
         private LocalDateTime updatedAt;
 
         public static ShipmentView of(Shipment e) {
+            return of(e, null);
+        }
+
+        public static ShipmentView of(Shipment e, String qcState) {
             ShipmentView v = new ShipmentView();
             v.setId(e.getId());
             v.setShipmentNo(e.getShipmentNo());
@@ -617,6 +811,15 @@ public final class Views {
             String next = shipmentNextStatus(e.getStatus());
             v.setNextStatus(next);
             v.setNextStatusName(next == null ? "" : shipmentStatusName(next));
+            v.setQcRoundId(e.getQcRoundId());
+            v.setFrozen(Boolean.TRUE.equals(e.getFrozen()));
+            v.setFrozenReason(e.getFrozenReason());
+            v.setFrozenAt(e.getFrozenAt());
+            if (qcState != null) {
+                v.setQcState(qcState);
+                v.setQcStateName(qcStateName(qcState));
+                v.setQcStateColor(qcStateColor(qcState));
+            }
             v.setUpdatedAt(e.getUpdatedAt());
             return v;
         }
@@ -640,6 +843,8 @@ public final class Views {
         private long quantityTotal;
         private BigDecimal amountTotal;
         private BigDecimal paidAmount;
+        /** 被质检冻结的待发出货单数（撤销放行/复检中/已驳回） */
+        private long frozenCount;
     }
 
     @Data

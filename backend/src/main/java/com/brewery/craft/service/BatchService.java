@@ -15,14 +15,17 @@ import org.springframework.transaction.annotation.Transactional;
 import com.brewery.craft.common.BizException;
 import com.brewery.craft.domain.Batch;
 import com.brewery.craft.domain.Fermenter;
+import com.brewery.craft.domain.QcRound;
 import com.brewery.craft.domain.Recipe;
 import com.brewery.craft.dto.BatchDtos;
 import com.brewery.craft.dto.Views;
 import com.brewery.craft.repository.BatchRepository;
+import com.brewery.craft.repository.BottlingRepository;
 import com.brewery.craft.repository.FermenterRepository;
+import com.brewery.craft.repository.QcRoundRepository;
 import com.brewery.craft.repository.RecipeRepository;
 
-/** 模块二：啤酒批次（状态流转 + @ElementCollection 曲线）。 */
+/** 模块二：啤酒批次（状态推进 + @ElementCollection 曲线）。 */
 @Service
 @Transactional(readOnly = true)
 public class BatchService {
@@ -30,36 +33,75 @@ public class BatchService {
     private final BatchRepository batchRepository;
     private final RecipeRepository recipeRepository;
     private final FermenterRepository fermenterRepository;
+    private final QcRoundRepository qcRoundRepository;
+    private final BottlingRepository bottlingRepository;
 
     public BatchService(BatchRepository batchRepository,
                         RecipeRepository recipeRepository,
-                        FermenterRepository fermenterRepository) {
+                        FermenterRepository fermenterRepository,
+                        QcRoundRepository qcRoundRepository,
+                        BottlingRepository bottlingRepository) {
         this.batchRepository = batchRepository;
         this.recipeRepository = recipeRepository;
         this.fermenterRepository = fermenterRepository;
+        this.qcRoundRepository = qcRoundRepository;
+        this.bottlingRepository = bottlingRepository;
     }
 
     public List<Views.BatchView> list(String status) {
         List<Batch> batches = status == null || status.isBlank()
                 ? batchRepository.findAllByOrderByBatchNoAsc()
                 : batchRepository.findAllByStatusOrderByBatchNoAsc(status);
+        // 批量带出最新一轮结论，列表页直接显示当前有效质检态
+        Map<Long, QcRound> latestByBatch = loadLatestRounds(batches);
         List<Views.BatchView> list = new ArrayList<>();
         for (Batch b : batches) {
-            list.add(view(b));
+            list.add(view(b, latestByBatch.get(b.getId())));
         }
         return list;
     }
 
     public Views.BatchView get(Long id) {
-        return view(batchRepository.findById(id).orElseThrow(() -> new BizException("批次不存在")));
+        Batch b = batchRepository.findById(id).orElseThrow(() -> new BizException("批次不存在"));
+        QcRound latest = b.getLatestQcId() == null ? null
+                : qcRoundRepository.findById(b.getLatestQcId()).orElse(null);
+        return view(b, latest);
+    }
+
+    /** 带全量轮次历史的详情视图 */
+    public Views.BatchView getWithRounds(Long id) {
+        Batch b = batchRepository.findById(id).orElseThrow(() -> new BizException("批次不存在"));
+        QcRound latest = b.getLatestQcId() == null ? null
+                : qcRoundRepository.findById(b.getLatestQcId()).orElse(null);
+        List<QcRound> rounds = qcRoundRepository.findAllByBatchIdOrderByRoundNoAsc(id);
+        return Views.BatchView.of(b, recipeName(b), latest, rounds);
+    }
+
+    private Map<Long, QcRound> loadLatestRounds(List<Batch> batches) {
+        Map<Long, QcRound> map = new java.util.HashMap<>();
+        for (Batch b : batches) {
+            if (b.getLatestQcId() != null) {
+                qcRoundRepository.findById(b.getLatestQcId()).ifPresent(r -> map.put(b.getId(), r));
+            }
+        }
+        return map;
     }
 
     private Views.BatchView view(Batch b) {
-        String recipeName = "";
-        if (b.getRecipeId() != null) {
-            recipeName = recipeRepository.findById(b.getRecipeId()).map(Recipe::getName).orElse("");
+        QcRound latest = b.getLatestQcId() == null ? null
+                : qcRoundRepository.findById(b.getLatestQcId()).orElse(null);
+        return view(b, latest);
+    }
+
+    private Views.BatchView view(Batch b, QcRound latest) {
+        return Views.BatchView.of(b, recipeName(b), latest, List.of());
+    }
+
+    private String recipeName(Batch b) {
+        if (b.getRecipeId() == null) {
+            return "";
         }
-        return Views.BatchView.of(b, recipeName);
+        return recipeRepository.findById(b.getRecipeId()).map(Recipe::getName).orElse("");
     }
 
     @Transactional
@@ -101,7 +143,7 @@ public class BatchService {
      */
     @Transactional
     public Views.BatchView advance(Long id, String targetStatus) {
-        Batch b = batchRepository.findById(id).orElseThrow(() -> new BizException("批次不存在"));
+        Batch b = batchRepository.findByIdForUpdate(id).orElseThrow(() -> new BizException("批次不存在"));
         if ("SCRAPPED".equals(b.getStatus())) {
             throw new BizException("已报废批次不能再推进");
         }
@@ -128,6 +170,14 @@ public class BatchService {
                 }
             }
             case "PACKAGED" -> {
+                // 终态规则：熟成 → 已灌装 必须以【最新一轮明确放行】为前提，
+                // 复检中/驳回/撤销放行一律不得完工，和灌装/出货走同一个裁决口径
+                QcRound latest = b.getLatestQcId() == null ? null
+                        : qcRoundRepository.findById(b.getLatestQcId()).orElse(null);
+                String reason = QcGate.qcBlockReason(latest);
+                if (reason != null) {
+                    throw new BizException("不能推进到已灌装：" + reason);
+                }
                 if (b.getActualMature() == null) {
                     b.setActualMature(LocalDate.now());
                 }
@@ -143,9 +193,20 @@ public class BatchService {
 
     @Transactional
     public Views.BatchView scrap(Long id) {
-        Batch b = batchRepository.findById(id).orElseThrow(() -> new BizException("批次不存在"));
+        Batch b = batchRepository.findByIdForUpdate(id)
+                .orElseThrow(() -> new BizException("批次不存在"));
         if ("PACKAGED".equals(b.getStatus())) {
             throw new BizException("已灌装批次不能报废");
+        }
+        // 终态规则：已有灌装实物的批次不允许直接报废（走专门的质量处置流程），
+        // 防止报废和质检放行/出货推进互相覆盖出矛盾状态
+        if (!bottlingRepository.findAllByBatchNoOrderByIdAsc(b.getBatchNo()).isEmpty()) {
+            throw new BizException("该批次已有灌装单，不能直接报废；请按质量事故流程处置已灌装产品");
+        }
+        QcRound latest = b.getLatestQcId() == null ? null
+                : qcRoundRepository.findById(b.getLatestQcId()).orElse(null);
+        if (latest != null && "OPEN".equals(latest.getResult())) {
+            throw new BizException("第 " + latest.getRoundNo() + " 轮质检正在送检中，请先提交结论或完成复检后再报废");
         }
         b.setStatus("SCRAPPED");
         b.setUpdatedAt(LocalDateTime.now());

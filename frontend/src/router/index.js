@@ -17,7 +17,7 @@ export const navItems = [
     path: '/batch',
     icon: '📅',
     label: '啤酒批次',
-    hint: '计划→糖化→煮沸→发酵→熟成→已灌装 状态推进'
+    hint: '质检送检/复检/放行/撤销留痕，放行后才能灌装出货'
   },
   {
     key: 'recipe',
